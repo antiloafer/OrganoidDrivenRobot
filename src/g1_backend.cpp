@@ -1,5 +1,6 @@
 #include "controller.hpp"
 
+#include <iostream>
 #include <memory>
 
 #include <unitree/robot/channel/channel_factory.hpp>
@@ -17,8 +18,16 @@ public:
 
     int send(const Command& command) override {
         const auto& velocity = command.velocity;
-        return client_.Move(static_cast<float>(velocity.vx), static_cast<float>(velocity.vy),
-                            static_cast<float>(velocity.vyaw), false);
+        const int rc = client_.Move(static_cast<float>(velocity.vx),
+                                    static_cast<float>(velocity.vy),
+                                    static_cast<float>(velocity.vyaw), false);
+        std::cout << format_log(command, rc == 0) << std::endl;
+        return rc;
+    }
+
+    void skip(const std::string& event_id) override {
+        const Command command{event_id, "skip", {}, "duplicate"};
+        std::cout << format_log(command, false) << std::endl;
     }
 
 private:

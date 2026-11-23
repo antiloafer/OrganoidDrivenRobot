@@ -94,9 +94,10 @@ private:
 
 class Session {
 public:
-    explicit Session(std::size_t fail_at = 0)
-        : backend(fail_at), worker_([this] {
-              result_ = mea::run_controller(input.reader(), stop.reader(), true, {}, backend);
+    explicit Session(std::size_t fail_at = 0, mea::Speeds speeds = {}, int watchdog_ms = 500)
+        : backend(fail_at), worker_([this, speeds, watchdog_ms] {
+              result_ = mea::run_controller(input.reader(), stop.reader(), true, speeds, backend,
+                                            watchdog_ms);
           }) {}
 
     ~Session() {
@@ -118,17 +119,30 @@ private:
     std::thread worker_;
 };
 
-std::string timestamp(std::chrono::milliseconds remaining) {
-    return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch() + remaining).count());
+std::int64_t now_unix_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-std::string forward(std::string_view id, const std::string& expiry = timestamp(5s)) {
-    const std::string timing = expiry.empty()
-        ? "null" : "{\"expires_at_unix_ms\":" + expiry + "}";
-    return "{\"schema_version\":\"mock-v1\",\"event_id\":\"" + std::string(id) +
-        "\",\"decision\":{\"accepted\":true},\"intent\":{\"type\":\"locomotion.translate\","
-        "\"params\":{\"direction\":\"forward\"}},\"live_timing\":" + timing + "}\n";
+std::string valid_timing(std::chrono::milliseconds remaining) {
+    const auto issued = now_unix_ms();
+    const auto expires = issued + remaining.count();
+    return "{\"issued_at_unix_ms\":" + std::to_string(issued) +
+           ",\"expires_at_unix_ms\":" + std::to_string(expires) + "}";
+}
+
+std::string make_event(std::string_view id, std::string_view intent_name,
+                       std::string_view direction, const std::string& timing_json) {
+    const std::string params = direction.empty()
+        ? "{}" : "{\"direction\":\"" + std::string(direction) + "\"}";
+    return "{\"schema_version\":1,\"event_id\":\"" + std::string(id) +
+        "\",\"decision\":{\"status\":\"accepted\",\"reason\":null},"
+        "\"intent\":{\"name\":\"" + std::string(intent_name) + "\",\"parameters\":" + params +
+        "},\"live_timing\":" + timing_json + "}\n";
+}
+
+std::string forward(std::string_view id, const std::string& timing_json = valid_timing(5s)) {
+    return make_event(id, "locomotion.translate", "forward", timing_json);
 }
 
 void require_stop(const Sent& sent, std::string_view reason, std::string_view event_id = {}) {
@@ -138,6 +152,35 @@ void require_stop(const Sent& sent, std::string_view reason, std::string_view ev
             "stop must send all zero velocities");
     require(command.reason == reason, "unexpected stop reason");
     require(command.event_id == event_id, "unexpected stop event ID");
+}
+
+void strafe_and_turn_velocities() {
+    Session session(0, mea::Speeds{0.25, 0.15, 0.4}, 500);
+    session.input.write(
+        make_event("fwd", "locomotion.translate", "forward", valid_timing(5s)) +
+        make_event("sl", "locomotion.translate", "left", valid_timing(5s)) +
+        make_event("sr", "locomotion.translate", "right", valid_timing(5s)) +
+        make_event("tl", "locomotion.turn", "left", valid_timing(5s)) +
+        make_event("tr", "locomotion.turn", "right", valid_timing(5s)) +
+        make_event("st", "locomotion.stop", "", valid_timing(5s))
+    );
+
+    const auto c1 = session.backend.wait_for_send(1).command;
+    require(c1.action == std::string_view("forward") && c1.velocity.vx == 0.25 && c1.velocity.vy == 0 && c1.velocity.vyaw == 0,
+            "unexpected forward velocity");
+    const auto c2 = session.backend.wait_for_send(2).command;
+    require(c2.action == std::string_view("strafe_left") && c2.velocity.vx == 0 && c2.velocity.vy == 0.15 && c2.velocity.vyaw == 0,
+            "unexpected strafe_left velocity");
+    const auto c3 = session.backend.wait_for_send(3).command;
+    require(c3.action == std::string_view("strafe_right") && c3.velocity.vx == 0 && c3.velocity.vy == -0.15 && c3.velocity.vyaw == 0,
+            "unexpected strafe_right velocity");
+    const auto c4 = session.backend.wait_for_send(4).command;
+    require(c4.action == std::string_view("turn_left") && c4.velocity.vx == 0 && c4.velocity.vy == 0 && c4.velocity.vyaw == 0.4,
+            "unexpected turn_left velocity");
+    const auto c5 = session.backend.wait_for_send(5).command;
+    require(c5.action == std::string_view("turn_right") && c5.velocity.vx == 0 && c5.velocity.vy == 0 && c5.velocity.vyaw == -0.4,
+            "unexpected turn_right velocity");
+    require_stop(session.backend.wait_for_send(6), "accepted", "st");
 }
 
 void watchdog_with_partial_input_and_duplicate() {
@@ -161,7 +204,7 @@ void watchdog_with_partial_input_and_duplicate() {
 
 void expiry_precedes_watchdog() {
     Session session;
-    session.input.write(forward("expiry", timestamp(180ms)));
+    session.input.write(forward("expiry", valid_timing(180ms)));
     const auto motion = session.backend.wait_for_send(1);
     require(motion.command.velocity.vx > 0, "valid timestamp must start motion");
     const auto stopped = session.backend.wait_for_send(2);
@@ -171,13 +214,20 @@ void expiry_precedes_watchdog() {
 
 void live_requires_valid_expiry() {
     Session session;
-    session.input.write(forward("missing", "") + forward("expired", "1") +
-                        forward("wrong-type", "\"123\"") +
-                        forward("overflow", "18446744073709551615"));
+    session.input.write(
+        forward("missing", "null") +
+        forward("expired", "{\"issued_at_unix_ms\":1,\"expires_at_unix_ms\":2}") +
+        forward("wrong-type", "{\"issued_at_unix_ms\":1,\"expires_at_unix_ms\":\"123\"}") +
+        forward("missing-issued", "{\"expires_at_unix_ms\":9999999999999}") +
+        forward("bad-order", "{\"issued_at_unix_ms\":500,\"expires_at_unix_ms\":500}") +
+        forward("overflow", "{\"issued_at_unix_ms\":1,\"expires_at_unix_ms\":18446744073709551615}")
+    );
     require_stop(session.backend.wait_for_send(1), "missing_expiry", "missing");
     require_stop(session.backend.wait_for_send(2), "expired", "expired");
     require_stop(session.backend.wait_for_send(3), "invalid_expiry", "wrong-type");
-    require_stop(session.backend.wait_for_send(4), "invalid_expiry", "overflow");
+    require_stop(session.backend.wait_for_send(4), "invalid_expiry", "missing-issued");
+    require_stop(session.backend.wait_for_send(5), "invalid_expiry", "bad-order");
+    require_stop(session.backend.wait_for_send(6), "invalid_expiry", "overflow");
 }
 
 void shutdown_while_moving(bool signal) {
@@ -214,6 +264,7 @@ void failing_shutdown_stop_is_an_error() {
 
 int main() {
     try {
+        strafe_and_turn_velocities();
         watchdog_with_partial_input_and_duplicate();
         expiry_precedes_watchdog();
         live_requires_valid_expiry();

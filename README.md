@@ -1,6 +1,6 @@
 # MEA 窗口到 Unitree G1 速度指令
 
-`mea_g1` 每行接收一个已经解码的 MEA 窗口，根据 `decision.accepted` 和 `intent` 生成速度指令。默认后端将每条结果写为一行 JSON。启用 SDK2 的构建也默认使用日志后端。
+`mea_g1` 每行接收一个符合 `DecodedEvent v1`（参见上级目录 `schema/decoded_event.v1.json`）的已解码 MEA 窗口，根据 `decision.status` 和 `intent` 生成速度指令 `(vx, vy, vyaw)`。默认后端将每条结果写为一行 JSON；启用 Unitree SDK2 的构建也默认使用日志后端，直到显式传入 `--g1 <网卡>`。
 
 ## 构建依赖
 
@@ -11,7 +11,7 @@ sudo apt update
 sudo apt install build-essential cmake nlohmann-json3-dev
 ```
 
-默认启用测试，需要 Python 3.7 或更新版本。在 Ubuntu 或 Debian 上可用 `sudo apt install python3` 安装。回放测试仅使用 Python 标准库。只构建程序时，在配置命令中加 `-DBUILD_TESTING=OFF`，并跳过 `ctest`。
+默认启用测试，需要 Python 3.7 或更新版本。回放测试仅使用 Python 标准库。只构建程序时，在配置命令中加 `-DBUILD_TESTING=OFF`，并跳过 `ctest`。
 
 迁移时复制 `CMakeLists.txt` 和 `src/`，回放或运行测试时带上 `examples/`，运行测试时再带上 `tests/`。在目标机重新生成 `build/` 和 `build-g1/`，因为 CMake 缓存记录了原机器上的绝对路径。
 
@@ -22,35 +22,39 @@ cmake -S . -B build
 cmake --build build -j
 (cd build && ctest --output-on-failure)
 
+./build/mea_g1 --capabilities
 ./build/mea_g1 --input examples/mock_windows.jsonl
 ./build/mea_g1 < examples/mock_windows.jsonl
 ```
 
-两种回放方式的输出一致。日志记录 `event_id`、`action`、`vx`、`vy`、`vyaw`、`reason` 和 `applied`。在日志后端，`applied` 表示生成了速度指令。重复事件的 `action` 为 `skip`，`applied` 为 `false`，该行的零值是日志占位。无法读取事件 ID 时记录 `null`。
+两种回放方式的输出一致。日志记录 `event_id`、`action`、`vx`、`vy`、`vyaw`、`reason` 和 `applied`。在日志后端，`applied` 表示生成了速度指令；在 G1 后端，`applied` 表示 `LocoClient::Move` 返回 `0`。重复事件的 `action` 为 `skip`，`applied` 为 `false`。无法读取事件 ID 时记录 `null`。
 
-| 样例事件 | 意图 | `vx`（m/s） | `vy`（m/s） | `vyaw`（rad/s） |
-| --- | --- | ---: | ---: | ---: |
-| `mock-01` | `locomotion.translate` + `forward` | +0.2 | 0 | 0 |
-| `mock-02` | `locomotion.translate` + `backward` | −0.2 | 0 | 0 |
-| `mock-03` | `locomotion.turn` + `left` | 0 | 0 | +0.3 |
-| `mock-04` | `locomotion.turn` + `right` | 0 | 0 | −0.3 |
-| `mock-05` | `locomotion.stop` | 0 | 0 | 0 |
+| 意图 (`intent.name`) | `parameters.direction` | `action` | `vx`（m/s） | `vy`（m/s） | `vyaw`（rad/s） |
+| --- | --- | --- | ---: | ---: | ---: |
+| `locomotion.translate` | `forward` | `forward` | `+linear` | `0` | `0` |
+| `locomotion.translate` | `backward` | `backward` | `-linear` | `0` | `0` |
+| `locomotion.translate` | `left` | `strafe_left` | `0` | `+lateral` | `0` |
+| `locomotion.translate` | `right` | `strafe_right` | `0` | `-lateral` | `0` |
+| `locomotion.turn` | `left` | `turn_left` | `0` | `0` | `+angular` |
+| `locomotion.turn` | `right` | `turn_right` | `0` | `0` | `-angular` |
+| `locomotion.stop` | `{}` | `stop` | `0` | `0` | `0` |
 
-其余样例覆盖拒判、重复事件、`translate + left` 横移、未知意图、空意图和坏行。可用 `--linear-speed` 和 `--angular-speed` 调整回放速度的幅值。
+可使用 `--linear-speed`、`--lateral-speed`（省略时跟随 `--linear-speed`）、`--angular-speed` 和 `--watchdog-ms`（50–1000，默认 500）调节参数；在无真机环境演练实时安全看门狗与过期机制时，可传入 `--live`（仅接受标准输入）。
 
-## 临时 JSONL 协议
+## `DecodedEvent v1` 协议
 
-字段参考见 [json_config.jpg](json_config.jpg)。临时协议使用 `schema_version: "mock-v1"` 和非空字符串 `event_id`。`decision.accepted` 是解码器给出的布尔接受状态。接受的窗口通过 `intent.type` 和 `intent.params.direction` 表达指令。停车意图可省略 `params`，拒判窗口可使用 `intent: null`。
+`mea_g1` 严格按正式 `DecodedEvent v1` 解析：
 
-离线样例使用 `live_timing: null`。实时模式的非零动作要求 `live_timing.expires_at_unix_ms` 为尚未到期的正整数 Unix 毫秒时间戳。每个进程按 `event_id` 对已解析窗口去重。单行上限为 1 MiB，超长行触发停车并丢弃到该行结束。实时生产者应以换行符提交每个窗口并及时刷新标准输出。离线回放也接受省略末尾换行符的最后一条记录。
+- `schema_version`: 必须为整数 `1`（旧版 `"mock-v1"` 或其他版本触发 `unsupported_schema` 停车）。
+- `event_id`: 非空字符串，每个进程维护有界去重表（最近 100,000 条）避免重复执行。
+- `decision.status`: 必须为 `"accepted"` 或 `"rejected"`。
+- `intent`: 接受时为 `{"name": "...", "parameters": {...}}`，拒判时必须为 `null`。
+- `live_timing`: 离线回放为 `null`；实时模式（`--live` 或 `--g1`）下非零动作必须提供包含正整数 `issued_at_unix_ms` 与 `expires_at_unix_ms`（且 `expires > issued` 且尚未过期）的对象。
+- 单行上限 1 MiB，超长行触发 `line_too_long` 停车并丢弃到该行结束。实时生产者应以 `\n` 提交每条窗口并立即刷新标准输出。
 
-样例保留了分类分数、解码器标识和采样元数据。控制器直接使用接受状态。拿到真实数据后，可在 `src/mea_json.cpp` 对齐协议字段。
+## 可选 G1 真机后端
 
-## 可选 G1 后端
-
-在基础构建依赖之外，启用 G1 后端还需要安装与目标机架构匹配的 Unitree SDK2。本项目已用 SDK2 2.0.0 验证。同架构迁移时可复制完整的 SDK2 安装目录，保留头文件、库、CMake 配置和符号链接。换到 ARM64 等其他架构时，安装对应架构的 SDK2 后重新构建。 [Unitree SDK2 安装说明](https://github.com/unitreerobotics/unitree_sdk2#installation)
-
-G1 版在运行时需要 SDK2 配套的 Cyclone DDS 动态库 `libddsc.so.0` 和 `libddscxx.so.0`。它们位于 SDK2 安装目录的 `lib/` 下。下例假设 SDK2 安装在 `/opt/unitree_robotics`，安装在其他位置时修改 `CMAKE_PREFIX_PATH`。
+在基础构建依赖之外，启用 G1 后端还需要安装与目标机架构匹配的 Unitree SDK2（已用 SDK2 2.0.0 验证）及其 Cyclone DDS 动态库 `libddsc.so.0` 和 `libddscxx.so.0`。
 
 ```bash
 cmake -S . -B build-g1 -DMEA_ENABLE_G1=ON -DCMAKE_PREFIX_PATH=/opt/unitree_robotics
@@ -58,17 +62,18 @@ cmake --build build-g1 -j
 (cd build-g1 && ctest --output-on-failure)
 ```
 
-实机运行还需要单独部署实际的 MEA 解码器及其运行环境和配置。以下命令中的 `./live-mea-decoder` 是占位名称，实际解码器应通过标准输出提供 JSONL。操作者先将 G1 切到可接受速度指令的状态，再按目标机的网卡名设置 `G1_NIC`，并设置 `G1_LINEAR_SPEED` 和 `G1_ANGULAR_SPEED`。
+实机运行时通过标准管道对接上游流式解码器（例如 `python -m organoid_g1.live_cli` 或 Web 实操平台）：
 
 ```bash
-./live-mea-decoder | ./build-g1/mea_g1 --g1 "$G1_NIC" \
-  --linear-speed "$G1_LINEAR_SPEED" --angular-speed "$G1_ANGULAR_SPEED"
+python -m organoid_g1.live_cli bxr \
+  --recording /data/20260826-0903-D90-CTRL/20260904-90-4_00.bxr \
+  --decoder results/d90-g1-pilot-01-v1/decoder.npz \
+| ./build-g1/mea_g1 --g1 "$G1_NIC" \
+  --linear-speed 0.15 --lateral-speed 0.12 --angular-speed 0.25
 ```
 
-两个速度幅值必须显式提供，并为可表示为 `float` 的有限正数。G1 后端仅从标准输入接收窗口。SDK 调用使用 `LocoClient::Move(vx, vy, vyaw, false)`，每条指令的 SDK 时长为 1 秒，停车使用全零速度。SDK 请求超时设置为 100 毫秒。 [Unitree G1 SDK 实现](https://github.com/unitreerobotics/unitree_sdk2/blob/main/include/unitree/robot/g1/loco/g1_loco_client.hpp)
+SDK 调用使用 `LocoClient::Move(vx, vy, vyaw, false)`（请求超时 100 毫秒），每条指令发送后同时向标准输出写入相同的 JSON 审计日志。
 
-- 拒判、空意图、无效记录、未注册意图和过期窗口触发零速度。实时非零动作缺少有效时间戳时也发送零速度。
-- 当前动作在窗口到期或距接收该有效动作满 500 毫秒时触发停车，取两者中较早者。重复窗口和未完成的输入行无法刷新计时。
+- 拒判、空意图、无效记录、未注册意图、旧协议版本和过期窗口均触发零速度。实时非零动作缺少有效时间戳时也发送零速度。
+- 当前动作在窗口到期或距接收满 `--watchdog-ms`（默认 500 毫秒）时触发停车，取较早者。重复窗口和未完成行无法刷新计时。
 - EOF、`SIGINT`、`SIGTERM`、输入错误或 SDK 调用失败时，程序尝试发送零速度后退出。SDK 错误输出到标准错误并返回非零退出码。
-
-两种构建均可运行相同的回放和假后端测试。测试覆盖速度符号、输入中断、过期、去重、退出和后端失败。实机联调时确认实际网卡和机器人方向。

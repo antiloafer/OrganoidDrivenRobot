@@ -7,7 +7,17 @@
 
 namespace mea {
 
-enum class Intent { none, unsupported, forward, backward, left, right, stop };
+enum class Intent {
+    none,
+    unsupported,
+    forward,
+    backward,
+    strafe_left,
+    strafe_right,
+    turn_left,
+    turn_right,
+    stop,
+};
 
 struct Window {
     std::string event_id;
@@ -27,6 +37,7 @@ struct Velocity {
 
 struct Speeds {
     double linear = 0.2;
+    double lateral = 0.2;
     double angular = 0.3;
 };
 
@@ -47,6 +58,7 @@ public:
 std::string format_log(const Command& command, bool applied = true);
 
 // stop_fd becomes readable when shutdown is requested.
-int run_controller(int input_fd, int stop_fd, bool live, Speeds speeds, Backend& backend);
+int run_controller(int input_fd, int stop_fd, bool live, Speeds speeds, Backend& backend,
+                   int watchdog_ms = 500);
 
 }  // namespace mea

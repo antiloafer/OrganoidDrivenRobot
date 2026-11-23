@@ -5,8 +5,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -18,8 +20,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
-constexpr milliseconds watchdog_interval{500};
 constexpr std::size_t max_line_bytes = 1024 * 1024;
+constexpr std::size_t max_seen_event_ids = 100000;
 
 std::int64_t unix_ms() {
     return std::chrono::duration_cast<milliseconds>(
@@ -30,7 +32,8 @@ Command stop(const std::string& event_id, const char* reason) {
     return {event_id, "stop", {}, reason};
 }
 
-Command map_window(const Window& window, Speeds speeds, bool live, Clock::time_point received) {
+Command map_window(const Window& window, Speeds speeds, bool live, Clock::time_point received,
+                   milliseconds watchdog_interval) {
     const auto& id = window.event_id;
     if (window.error) return stop(id, window.error);
     if (!window.accepted) return stop(id, "rejected");
@@ -46,11 +49,13 @@ Command map_window(const Window& window, Speeds speeds, bool live, Clock::time_p
     }
 
     switch (window.intent) {
-        case Intent::forward:  return {id, "forward", {speeds.linear, 0, 0}, "accepted"};
-        case Intent::backward: return {id, "backward", {-speeds.linear, 0, 0}, "accepted"};
-        case Intent::left:     return {id, "left", {0, 0, speeds.angular}, "accepted"};
-        case Intent::right:    return {id, "right", {0, 0, -speeds.angular}, "accepted"};
-        default:              return stop(id, "unsupported_intent");
+        case Intent::forward:      return {id, "forward", {speeds.linear, 0, 0}, "accepted"};
+        case Intent::backward:     return {id, "backward", {-speeds.linear, 0, 0}, "accepted"};
+        case Intent::strafe_left:  return {id, "strafe_left", {0, speeds.lateral, 0}, "accepted"};
+        case Intent::strafe_right: return {id, "strafe_right", {0, -speeds.lateral, 0}, "accepted"};
+        case Intent::turn_left:    return {id, "turn_left", {0, 0, speeds.angular}, "accepted"};
+        case Intent::turn_right:   return {id, "turn_right", {0, 0, -speeds.angular}, "accepted"};
+        default:                   return stop(id, "unsupported_intent");
     }
 }
 
@@ -76,8 +81,11 @@ struct Timer {
 
 class Controller {
 public:
-    Controller(Backend& backend, Speeds speeds, bool live)
-        : backend_(backend), speeds_(speeds), live_(live) {}
+    Controller(Backend& backend, Speeds speeds, bool live, milliseconds watchdog_interval)
+        : backend_(backend),
+          speeds_(speeds),
+          live_(live),
+          watchdog_interval_(watchdog_interval) {}
 
     Timer timer() const {
         if (!active_) {
@@ -104,17 +112,17 @@ public:
     }
 
     bool handle(const Window& window, Clock::time_point received) {
-        if (!window.error && !seen_.insert(window.event_id).second) {
+        if (!window.error && !record_seen(window.event_id)) {
             backend_.skip(window.event_id);
             return true;
         }
-        const auto command = map_window(window, speeds_, live_, received);
+        const auto command = map_window(window, speeds_, live_, received, watchdog_interval_);
         if (!send(backend_, command)) {
             return false;
         }
         const auto& velocity = command.velocity;
         if (live_ && (velocity.vx != 0 || velocity.vy != 0 || velocity.vyaw != 0)) {
-            active_ = Motion{window.event_id, *window.expires_at_ms, received + watchdog_interval};
+            active_ = Motion{window.event_id, *window.expires_at_ms, received + watchdog_interval_};
         } else {
             active_.reset();
         }
@@ -122,6 +130,18 @@ public:
     }
 
 private:
+    bool record_seen(const std::string& event_id) {
+        if (!seen_.insert(event_id).second) {
+            return false;
+        }
+        seen_order_.push_back(event_id);
+        if (seen_order_.size() > max_seen_event_ids) {
+            seen_.erase(seen_order_.front());
+            seen_order_.pop_front();
+        }
+        return true;
+    }
+
     struct Motion {
         std::string event_id;
         std::int64_t expires_at_ms;
@@ -131,7 +151,9 @@ private:
     Backend& backend_;
     Speeds speeds_;
     bool live_;
+    milliseconds watchdog_interval_;
     std::unordered_set<std::string> seen_;
+    std::deque<std::string> seen_order_;
     std::optional<Motion> active_;
 };
 
@@ -227,8 +249,13 @@ Exit read_windows(int input_fd, int stop_fd, bool live, Controller& controller) 
 
 }  // namespace
 
-int run_controller(int input_fd, int stop_fd, bool live, Speeds speeds, Backend& backend) {
-    Controller controller(backend, speeds, live);
+int run_controller(int input_fd, int stop_fd, bool live, Speeds speeds, Backend& backend,
+                   int watchdog_ms) {
+    if (watchdog_ms <= 0 || watchdog_ms > 1000) {
+        std::cerr << "Controller error: watchdog_ms must be within 1..1000\n";
+        return 2;
+    }
+    Controller controller(backend, speeds, live, milliseconds{watchdog_ms});
     Exit result{"controller_error", 1};
     try {
         result = read_windows(input_fd, stop_fd, live, controller);

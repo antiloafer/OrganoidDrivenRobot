@@ -51,15 +51,32 @@ struct Options {
     std::string input;
     std::string interface;
     mea::Speeds speeds;
+    int watchdog_ms = 500;
     bool linear_set = false;
+    bool lateral_set = false;
     bool angular_set = false;
+    bool live_log = false;
+    bool capabilities = false;
     bool help = false;
 };
 
 void usage(std::ostream& output) {
-    output << "Usage: mea_g1 [--input <file>] [--linear-speed <m/s>] "
-              "[--angular-speed <rad/s>]\n"
-              "       mea_g1 --g1 <interface> --linear-speed <m/s> --angular-speed <rad/s>\n";
+    output << "Usage: mea_g1 [--input <file>] [--live] [--linear-speed <m/s>] "
+              "[--lateral-speed <m/s>] [--angular-speed <rad/s>] [--watchdog-ms <ms>]\n"
+              "       mea_g1 --g1 <interface> --linear-speed <m/s> --angular-speed <rad/s> "
+              "[--lateral-speed <m/s>] [--watchdog-ms <ms>]\n"
+              "       mea_g1 --capabilities\n";
+}
+
+void print_capabilities(std::ostream& output) {
+#ifdef MEA_ENABLE_G1
+    constexpr const char* g1_flag = "true";
+#else
+    constexpr const char* g1_flag = "false";
+#endif
+    output << "{\"schema_version\":1,\"g1_backend\":" << g1_flag
+           << ",\"live_log\":true,\"intents\":[\"locomotion.translate\","
+              "\"locomotion.turn\",\"locomotion.stop\"]}\n";
 }
 
 double parse_speed(const std::string& value, const std::string& flag) {
@@ -78,6 +95,20 @@ double parse_speed(const std::string& value, const std::string& flag) {
     return speed;
 }
 
+int parse_watchdog_ms(const std::string& value) {
+    std::size_t consumed = 0;
+    long parsed = 0;
+    try {
+        parsed = std::stol(value, &consumed, 10);
+    } catch (const std::invalid_argument&) {
+    } catch (const std::out_of_range&) {
+    }
+    if (consumed != value.size() || parsed < 50 || parsed > 1000) {
+        throw std::invalid_argument("--watchdog-ms requires an integer between 50 and 1000");
+    }
+    return static_cast<int>(parsed);
+}
+
 Options parse_options(int argc, char* argv[]) {
     Options options;
     for (int i = 1; i < argc; ++i) {
@@ -86,8 +117,16 @@ Options parse_options(int argc, char* argv[]) {
             options.help = true;
             return options;
         }
+        if (flag == "--capabilities") {
+            options.capabilities = true;
+            return options;
+        }
+        if (flag == "--live") {
+            options.live_log = true;
+            continue;
+        }
         if (flag != "--input" && flag != "--g1" && flag != "--linear-speed" &&
-            flag != "--angular-speed") {
+            flag != "--lateral-speed" && flag != "--angular-speed" && flag != "--watchdog-ms") {
             throw std::invalid_argument("Unknown option: " + flag);
         }
         if (i + 1 == argc || argv[i + 1][0] == '\0' ||
@@ -102,10 +141,21 @@ Options parse_options(int argc, char* argv[]) {
         } else if (flag == "--linear-speed") {
             options.speeds.linear = parse_speed(value, flag);
             options.linear_set = true;
-        } else {
+        } else if (flag == "--lateral-speed") {
+            options.speeds.lateral = parse_speed(value, flag);
+            options.lateral_set = true;
+        } else if (flag == "--angular-speed") {
             options.speeds.angular = parse_speed(value, flag);
             options.angular_set = true;
+        } else {
+            options.watchdog_ms = parse_watchdog_ms(value);
         }
+    }
+    if (options.linear_set && !options.lateral_set) {
+        options.speeds.lateral = options.speeds.linear;
+    }
+    if (options.live_log && !options.input.empty()) {
+        throw std::invalid_argument("--live reads from stdin and disallows --input");
     }
     if (!options.interface.empty()) {
         if (!options.input.empty()) {
@@ -160,6 +210,10 @@ int main(int argc, char* argv[]) {
         usage(std::cout);
         return 0;
     }
+    if (options.capabilities) {
+        print_capabilities(std::cout);
+        return 0;
+    }
 
     try {
         if (options.input.empty() && ::fcntl(STDIN_FILENO, F_GETFD) < 0) {
@@ -171,11 +225,13 @@ int main(int argc, char* argv[]) {
 #ifdef MEA_ENABLE_G1
         if (!options.interface.empty()) {
             auto g1 = mea::make_g1_backend(options.interface);
-            return mea::run_controller(input_fd, signals.get(), true, options.speeds, *g1);
+            return mea::run_controller(input_fd, signals.get(), true, options.speeds, *g1,
+                                       options.watchdog_ms);
         }
 #endif
         LogBackend log;
-        return mea::run_controller(input_fd, signals.get(), false, options.speeds, log);
+        return mea::run_controller(input_fd, signals.get(), options.live_log, options.speeds, log,
+                                   options.watchdog_ms);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
